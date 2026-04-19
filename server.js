@@ -8,7 +8,8 @@ const MONGO_URI = "mongodb+srv://rustiarhedmarcus_db_user:bruhman123@cluster0.5t
 // ==================== SCHEMA ====================
 const messageSchema = new mongoose.Schema({
   type: { type: String, enum: ["chat", "system"], required: true },
-  username: { type: String, required: true },
+  username: { type: String, required: true }, // Real name (for logs)
+  displayName: { type: String, required: true }, // What users see
   message: { type: String, required: true },
   timestamp: { type: Number, required: true },
   scope: { type: String, enum: ["global", "server"], default: "global" },
@@ -24,7 +25,7 @@ mongoose.connect(MONGO_URI)
   .catch((e) => console.error("❌ MongoDB error:", e.message));
 
 // ==================== STATE ====================
-const clients = new Map(); // username -> { socket, gameId, serverId }
+const clients = new Map();
 
 // ==================== SERVER ====================
 const server = http.createServer((req, res) => {
@@ -36,6 +37,7 @@ const wss = new WebSocketServer({ server });
 
 wss.on("connection", (socket) => {
   let username = "";
+  let displayName = "";
   let gameId = "";
   let serverId = "";
   console.log("🔌 New connection");
@@ -53,10 +55,10 @@ wss.on("connection", (socket) => {
     // ---- JOIN ----
     if (data.type === "join" && data.username) {
       username = String(data.username).slice(0, 50);
+      displayName = String(data.displayName || data.username).slice(0, 50);
       gameId = String(data.gameId || "").slice(0, 100);
       serverId = String(data.serverId || "").slice(0, 100);
 
-      // Kill duplicate socket for same username
       if (clients.has(username)) {
         const old = clients.get(username);
         if (old.socket !== socket) {
@@ -65,18 +67,15 @@ wss.on("connection", (socket) => {
         }
       }
 
-      clients.set(username, { socket, gameId, serverId });
-      console.log(`👋 JOIN: ${username} (${clients.size} online)`);
+      clients.set(username, { socket, displayName, gameId, serverId });
+      console.log(`👋 JOIN: ${displayName} (${username}) (${clients.size} online)`);
 
-      // Send history immediately (both global and server)
       try {
-        // Global history (last 50)
         const globalHistory = await Message.find({ type: "chat", scope: "global" })
           .sort({ timestamp: -1 })
           .limit(50)
           .lean();
 
-        // Server history (last 50 for this game+server)
         const serverHistory = await Message.find({ 
           type: "chat", 
           scope: "server",
@@ -87,7 +86,6 @@ wss.on("connection", (socket) => {
           .limit(50)
           .lean();
 
-        // Send as batch instead of one by one
         const historyBatch = {
           type: "history",
           global: globalHistory.reverse(),
@@ -96,17 +94,17 @@ wss.on("connection", (socket) => {
         
         if (socket.readyState === 1) {
           socket.send(JSON.stringify(historyBatch));
-          console.log(`📜 Sent ${globalHistory.length} global + ${serverHistory.length} server messages to ${username}`);
+          console.log(`📜 Sent ${globalHistory.length} global + ${serverHistory.length} server messages`);
         }
       } catch (e) {
         console.error("❌ History error:", e.message);
       }
 
-      // Broadcast join notice (global)
       const joinMsg = {
         type: "system",
         username: "Archivist",
-        message: `${username} joined`,
+        displayName: "Archivist",
+        message: `${displayName} joined`,
         timestamp: Date.now(),
         scope: "global"
       };
@@ -118,11 +116,13 @@ wss.on("connection", (socket) => {
     if (data.type === "chat" && username && data.message) {
       const text = String(data.message).slice(0, 200);
       const scope = data.scope === "server" ? "server" : "global";
-      console.log(`💬 [${scope}] ${username}: ${text}`);
+      const msgDisplayName = String(data.displayName || username).slice(0, 50);
+      console.log(`💬 [${scope}] ${msgDisplayName} (${username}): ${text}`);
 
       const msg = {
         type: "chat",
-        username,
+        username: username, // Real name for logs/identification
+        displayName: msgDisplayName, // What everyone sees
         message: text,
         timestamp: Date.now(),
         scope,
@@ -135,14 +135,12 @@ wss.on("connection", (socket) => {
       const json = JSON.stringify(msg);
       
       if (scope === "global") {
-        // Send to EVERYONE (all servers, all games)
         for (const [, client] of clients.entries()) {
           if (client.socket.readyState === 1) {
             client.socket.send(json);
           }
         }
       } else {
-        // Send only to same game+server
         for (const [, client] of clients.entries()) {
           if (client.gameId === gameId && client.serverId === serverId && client.socket.readyState === 1) {
             client.socket.send(json);
@@ -153,7 +151,7 @@ wss.on("connection", (socket) => {
   });
 
   socket.on("close", async () => {
-    console.log(`👋 DISCONNECT: ${username || "unknown"}`);
+    console.log(`👋 DISCONNECT: ${displayName || username || "unknown"}`);
 
     if (username && clients.get(username)?.socket === socket) {
       clients.delete(username);
@@ -161,7 +159,8 @@ wss.on("connection", (socket) => {
       const msg = {
         type: "system",
         username: "Archivist",
-        message: `${username} left`,
+        displayName: "Archivist",
+        message: `${displayName || username} left`,
         timestamp: Date.now(),
         scope: "global"
       };
