@@ -5,7 +5,7 @@ const mongoose = require("mongoose");
 const PORT = process.env.PORT || 8080;
 const MONGO_URI = "mongodb+srv://rustiarhedmarcus_db_user:bruhman123@cluster0.5trtutu.mongodb.net/archivist?appName=Cluster0";
 
-// ==================== MONGODB SCHEMA ====================
+// ==================== SCHEMA ====================
 const messageSchema = new mongoose.Schema({
   type: { type: String, enum: ["chat", "system"], required: true },
   username: { type: String, required: true },
@@ -15,15 +15,16 @@ const messageSchema = new mongoose.Schema({
 
 const Message = mongoose.model("Message", messageSchema);
 
-// ==================== CONNECT TO MONGO ====================
+// ==================== MONGO ====================
 mongoose.connect(MONGO_URI)
   .then(() => console.log("✅ MongoDB connected"))
-  .catch((e) => console.error("❌ MongoDB connection error:", e.message));
+  .catch((e) => console.error("❌ MongoDB error:", e.message));
 
-// ==================== CLIENTS ====================
+// ==================== STATE ====================
+// Only one socket per username — kills old one if same user rejoins
 const clients = new Map();
 
-// ==================== HTTP + WS SERVER ====================
+// ==================== SERVER ====================
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("Archivist Chat Server");
@@ -31,25 +32,9 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ server });
 
-wss.on("connection", async (socket) => {
+wss.on("connection", (socket) => {
   let username = "";
   console.log("🔌 New connection");
-
-  // Send last 50 messages from DB
-  try {
-    const history = await Message.find().sort({ timestamp: 1 }).limit(50).lean();
-    for (const msg of history) {
-      socket.send(JSON.stringify({
-        type: msg.type,
-        username: msg.username,
-        message: msg.message,
-        timestamp: msg.timestamp,
-      }));
-    }
-    console.log(`📜 Sent ${history.length} history messages`);
-  } catch (e) {
-    console.error("❌ History fetch error:", e.message);
-  }
 
   socket.on("message", async (raw) => {
     let data;
@@ -61,22 +46,54 @@ wss.on("connection", async (socket) => {
 
     if (data.type === "ping") return;
 
+    // ---- JOIN ----
     if (data.type === "join" && data.username) {
       username = String(data.username).slice(0, 50);
-      clients.set(username, socket);
-      console.log(`👋 JOIN: ${username}`);
 
-      const msg = {
+      // Kill duplicate socket for same username (Xeno double-connects)
+      if (clients.has(username)) {
+        const old = clients.get(username);
+        if (old !== socket) {
+          console.log(`⚠️ Duplicate join for ${username}, closing old socket`);
+          old.terminate();
+        }
+      }
+
+      clients.set(username, socket);
+      console.log(`👋 JOIN: ${username} (${clients.size} online)`);
+
+      // Send history AFTER join so UI is ready
+      try {
+        const history = await Message.find({ type: "chat" })
+          .sort({ timestamp: -1 })
+          .limit(50)
+          .lean();
+
+        history.reverse().forEach((msg) => {
+          socket.send(JSON.stringify({
+            type: msg.type,
+            username: msg.username,
+            message: msg.message,
+            timestamp: msg.timestamp,
+          }));
+        });
+        console.log(`📜 Sent ${history.length} history messages to ${username}`);
+      } catch (e) {
+        console.error("❌ History fetch error:", e.message);
+      }
+
+      // Broadcast join notice to everyone else
+      const joinMsg = {
         type: "system",
         username: "Archivist",
         message: `${username} joined`,
         timestamp: Date.now(),
       };
-
-      try { await Message.create(msg); } catch (e) { console.error("❌ Save error:", e.message); }
-      broadcast(JSON.stringify(msg), username);
+      try { await Message.create(joinMsg); } catch (e) { console.error("❌ Save error:", e.message); }
+      broadcastExclude(JSON.stringify(joinMsg), username);
     }
 
+    // ---- CHAT ----
     if (data.type === "chat" && username && data.message) {
       const text = String(data.message).slice(0, 200);
       console.log(`💬 ${username}: ${text}`);
@@ -90,34 +107,42 @@ wss.on("connection", async (socket) => {
 
       try { await Message.create(msg); } catch (e) { console.error("❌ Save error:", e.message); }
 
+      // Send to ALL clients including sender
       const json = JSON.stringify(msg);
       for (const [, client] of clients.entries()) {
-        if (client.readyState === 1) client.send(json);
+        if (client.readyState === 1) {
+          client.send(json);
+        }
       }
     }
   });
 
   socket.on("close", async () => {
     console.log(`👋 DISCONNECT: ${username || "unknown"}`);
+
     if (username) {
-      clients.delete(username);
+      // Only remove from map if this is still the active socket for that user
+      if (clients.get(username) === socket) {
+        clients.delete(username);
 
-      const msg = {
-        type: "system",
-        username: "Archivist",
-        message: `${username} left`,
-        timestamp: Date.now(),
-      };
+        const msg = {
+          type: "system",
+          username: "Archivist",
+          message: `${username} left`,
+          timestamp: Date.now(),
+        };
 
-      try { await Message.create(msg); } catch (e) { console.error("❌ Save error:", e.message); }
-      broadcast(JSON.stringify(msg));
+        try { await Message.create(msg); } catch (e) { console.error("❌ Save error:", e.message); }
+        broadcastExclude(JSON.stringify(msg), username);
+      }
     }
   });
 
   socket.on("error", (e) => console.error("⚠️ Socket error:", e.message));
 });
 
-function broadcast(json, excludeUsername) {
+// Broadcast to everyone EXCEPT one username
+function broadcastExclude(json, excludeUsername) {
   for (const [name, client] of clients.entries()) {
     if (name !== excludeUsername && client.readyState === 1) {
       client.send(json);
@@ -125,22 +150,24 @@ function broadcast(json, excludeUsername) {
   }
 }
 
-// Keep last 500 messages in DB, prune older ones periodically
+// Prune DB to last 500 messages every hour
 async function pruneHistory() {
   try {
     const count = await Message.countDocuments();
     if (count > 500) {
-      const oldest = await Message.find().sort({ timestamp: 1 }).limit(count - 500).select("_id").lean();
-      const ids = oldest.map(m => m._id);
-      await Message.deleteMany({ _id: { $in: ids } });
-      console.log(`🧹 Pruned ${ids.length} old messages`);
+      const oldest = await Message.find()
+        .sort({ timestamp: 1 })
+        .limit(count - 500)
+        .select("_id")
+        .lean();
+      await Message.deleteMany({ _id: { $in: oldest.map((m) => m._id) } });
+      console.log(`🧹 Pruned ${oldest.length} old messages`);
     }
   } catch (e) {
     console.error("❌ Prune error:", e.message);
   }
 }
 
-// Prune every hour
 setInterval(pruneHistory, 60 * 60 * 1000);
 
 server.listen(PORT, () => {
