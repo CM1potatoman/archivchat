@@ -1,19 +1,29 @@
 const { WebSocketServer } = require("ws");
 const http = require("http");
+const mongoose = require("mongoose");
 
 const PORT = process.env.PORT || 8080;
+const MONGO_URI = "mongodb+srv://rustiarhedmarcus_db_user:bruhman123@cluster0.5trtutu.mongodb.net/archivist?appName=Cluster0";
 
-// In-memory message history (last 200 messages)
-const history = [];
+// ==================== MONGODB SCHEMA ====================
+const messageSchema = new mongoose.Schema({
+  type: { type: String, enum: ["chat", "system"], required: true },
+  username: { type: String, required: true },
+  message: { type: String, required: true },
+  timestamp: { type: Number, required: true },
+});
 
-function saveMessage(msg) {
-  history.push(msg);
-  if (history.length > 200) history.shift();
-}
+const Message = mongoose.model("Message", messageSchema);
 
-// Track connected clients: username -> ws
+// ==================== CONNECT TO MONGO ====================
+mongoose.connect(MONGO_URI)
+  .then(() => console.log("✅ MongoDB connected"))
+  .catch((e) => console.error("❌ MongoDB connection error:", e.message));
+
+// ==================== CLIENTS ====================
 const clients = new Map();
 
+// ==================== HTTP + WS SERVER ====================
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("Archivist Chat Server");
@@ -21,17 +31,27 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ server });
 
-wss.on("connection", (socket) => {
+wss.on("connection", async (socket) => {
   let username = "";
   console.log("🔌 New connection");
 
-  // Send history to new connection
-  for (const msg of history.slice(-50)) {
-    socket.send(JSON.stringify(msg));
+  // Send last 50 messages from DB
+  try {
+    const history = await Message.find().sort({ timestamp: 1 }).limit(50).lean();
+    for (const msg of history) {
+      socket.send(JSON.stringify({
+        type: msg.type,
+        username: msg.username,
+        message: msg.message,
+        timestamp: msg.timestamp,
+      }));
+    }
+    console.log(`📜 Sent ${history.length} history messages`);
+  } catch (e) {
+    console.error("❌ History fetch error:", e.message);
   }
-  console.log(`📜 Sent ${Math.min(history.length, 50)} history messages`);
 
-  socket.on("message", (raw) => {
+  socket.on("message", async (raw) => {
     let data;
     try {
       data = JSON.parse(raw.toString());
@@ -53,7 +73,7 @@ wss.on("connection", (socket) => {
         timestamp: Date.now(),
       };
 
-      saveMessage(msg);
+      try { await Message.create(msg); } catch (e) { console.error("❌ Save error:", e.message); }
       broadcast(JSON.stringify(msg), username);
     }
 
@@ -68,19 +88,16 @@ wss.on("connection", (socket) => {
         timestamp: Date.now(),
       };
 
-      saveMessage(msg);
-      const json = JSON.stringify(msg);
+      try { await Message.create(msg); } catch (e) { console.error("❌ Save error:", e.message); }
 
-      // Send to everyone including sender
+      const json = JSON.stringify(msg);
       for (const [, client] of clients.entries()) {
-        if (client.readyState === 1) {
-          client.send(json);
-        }
+        if (client.readyState === 1) client.send(json);
       }
     }
   });
 
-  socket.on("close", () => {
+  socket.on("close", async () => {
     console.log(`👋 DISCONNECT: ${username || "unknown"}`);
     if (username) {
       clients.delete(username);
@@ -92,7 +109,7 @@ wss.on("connection", (socket) => {
         timestamp: Date.now(),
       };
 
-      saveMessage(msg);
+      try { await Message.create(msg); } catch (e) { console.error("❌ Save error:", e.message); }
       broadcast(JSON.stringify(msg));
     }
   });
@@ -107,6 +124,24 @@ function broadcast(json, excludeUsername) {
     }
   }
 }
+
+// Keep last 500 messages in DB, prune older ones periodically
+async function pruneHistory() {
+  try {
+    const count = await Message.countDocuments();
+    if (count > 500) {
+      const oldest = await Message.find().sort({ timestamp: 1 }).limit(count - 500).select("_id").lean();
+      const ids = oldest.map(m => m._id);
+      await Message.deleteMany({ _id: { $in: ids } });
+      console.log(`🧹 Pruned ${ids.length} old messages`);
+    }
+  } catch (e) {
+    console.error("❌ Prune error:", e.message);
+  }
+}
+
+// Prune every hour
+setInterval(pruneHistory, 60 * 60 * 1000);
 
 server.listen(PORT, () => {
   console.log(`🚀 Archivist Chat running on port ${PORT}`);
